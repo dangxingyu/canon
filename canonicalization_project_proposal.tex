@@ -1,0 +1,1022 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{microtype}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  citecolor=blue,
+  urlcolor=blue
+}
+
+% ------------------------------------------------------------
+% Macros
+% ------------------------------------------------------------
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\KL}{\mathrm{KL}}
+\newcommand{\softmax}{\mathrm{softmax}}
+\newcommand{\rank}{\mathrm{rank}}
+\newcommand{\cond}{\mathrm{cond}}
+\newcommand{\argmin}{\operatorname*{arg\,min}}
+\newcommand{\argmax}{\operatorname*{arg\,max}}
+\newcommand{\GL}{\mathsf{GL}}
+\newcommand{\OO}{\mathsf{O}}
+\newcommand{\SPD}{\mathsf{SPD}}
+\newcommand{\grp}{\mathrm{grp}}
+\newcommand{\calA}{\mathcal{A}}
+\newcommand{\calC}{\mathcal{C}}
+\newcommand{\calD}{\mathcal{D}}
+\newcommand{\calE}{\mathcal{E}}
+\newcommand{\calG}{\mathcal{G}}
+\newcommand{\calL}{\mathcal{L}}
+\newcommand{\calT}{\mathcal{T}}
+\newcommand{\thetazero}{\theta_0}
+\newcommand{\thetaft}{\theta_g}
+
+\newtheorem{definition}{Definition}
+\newtheorem{proposition}{Proposition}
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}{Lemma}
+\newtheorem{claim}{Claim}
+\newtheorem{remark}{Remark}
+
+\title{Project Proposal: Finetuning-Friendly Canonicalization of Transformer Checkpoints}
+\author{Research Plan}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This project studies \emph{function-preserving canonicalization} of pretrained Transformer checkpoints as a way to make downstream adaptation easier. The core observation is simple: many modern Transformer parameterizations contain nontrivial gauge freedom, so multiple checkpoints can implement essentially the same inference function. Practical adaptation algorithms - AdamW, LoRA, QLoRA, DoRA, PiSSA, DPO, PPO/GRPO, gradient clipping, weight decay, and low-precision training - are not invariant to these reparameterizations. Therefore, the representative of a pretrained model inside its gauge orbit matters.
+
+The project goal is to choose a canonical representative that improves SFT/LoRA/QLoRA/RL fine-tuning speed, stability, and final quality without changing initial inference behavior. The strongest first experiments are: (i) exact value-output activation-gradient balancing in grouped-query attention, (ii) exact SwiGLU hidden-channel balancing, and (iii) quantization-aware gauge selection before QLoRA. Given available compute for 0.6B--1B models, the main empirical suite should use Qwen3-0.6B-Base and Llama-3.2-1B as primary small modern bases, plus overtrained or learning-rate-decayed variants as controlled hard-to-adapt checkpoints. Evaluation should use standard 2025-era benchmarks such as AIME, MATH-500, LiveCodeBench, MBPP/MBPP+, BigCodeBench, IFEval, and BFCL.
+\end{abstract}
+
+\tableofcontents
+
+% ============================================================
+\section{One-Sentence Thesis}
+% ============================================================
+
+\begin{quote}
+\textbf{Transformer checkpoints should be canonicalized before adaptation: choose a function-preserving representative whose local geometry is better matched to the fine-tuning algorithm.}
+\end{quote}
+
+This is not an anti-finetuning or obfuscation project. The objective is constructive: make useful downstream fine-tuning easier while preserving the base model's initial behavior.
+
+% ============================================================
+\section{What Changes Relative to the Previous Direction}
+% ============================================================
+
+The previous direction treated gauge transformations as a way to sabotage adaptation. That direction is fragile because exact gauge transformations change coordinates, not quotient-level function classes. A strong adaptive user can canonicalize the checkpoint and train in a better-conditioned representative.
+
+The new direction uses the same mathematical object positively. Instead of asking
+\[
+    \text{Can we make adaptation harder?}
+\]
+we ask
+\[
+    \text{Can we make adaptation systematically easier by choosing better coordinates?}
+\]
+
+The anti-finetuning sections should be removed from the main proposal. The remaining useful pieces are:
+\begin{enumerate}[leftmargin=*]
+    \item exact Transformer gauge symmetries;
+    \item precision-aware functionality preservation;
+    \item value-output balancing;
+    \item MLP hidden-channel balancing;
+    \item LoRA/QLoRA-aware low-rank geometry;
+    \item RL stability metrics such as KL-per-reward-gain.
+\end{enumerate}
+
+% ============================================================
+\section{Problem Formulation}
+% ============================================================
+
+Let $f_{\thetazero}$ be a pretrained base Transformer. Let $\calG$ be a set of exact or near-exact functionality-preserving transformations. For $g\in\calG$, write
+\[
+    \thetaft = g\cdot \thetazero.
+\]
+
+\begin{definition}[Precision-aware equivalence set]
+Fix an inference precision \texttt{prec}, calibration distribution $D_{\mathrm{cal}}$, distance $d(\cdot,\cdot)$, and tolerance $\delta$. Define
+\[
+    \calE_{\delta}^{\texttt{prec}}(\thetazero)
+    =
+    \left\{
+    \theta:
+    \E_{x\sim D_{\mathrm{cal}}}
+    d(f_{\theta}(x),f_{\thetazero}(x))
+    \le \delta
+    \text{ under precision \texttt{prec}}
+    \right\}.
+\]
+Typical distances are logit MSE, token-level KL, perplexity delta, top-$k$ token disagreement, benchmark delta, or generation-level agreement.
+\end{definition}
+
+\begin{definition}[Finetuning-friendly canonicalization]
+For a task distribution $\Pi_{\mathrm{ft}}$ and adaptation algorithm class $\calA$, choose
+\[
+    g^\star
+    =
+    \argmin_{g\in\calG}
+    \E_{\tau\sim\Pi_{\mathrm{ft}}}
+    R_\tau\left(
+    \mathrm{FT}_{\calA,b}(g\cdot\thetazero)
+    \right)
+\]
+subject to
+\[
+    g\cdot\thetazero\in \calE_{\delta}^{\texttt{prec}}(\thetazero).
+\]
+\end{definition}
+
+The fixed-budget metric is more useful than final-best-score alone:
+\[
+    \Delta_{\mathrm{fixed}}(g;\tau,b)
+    =
+    S_{\tau}\left(\mathrm{FT}_{\calA,b}(g\cdot\thetazero)\right)
+    -
+    S_{\tau}\left(\mathrm{FT}_{\calA,b}(\thetazero)\right),
+\]
+where $S_\tau$ is task score. Also measure steps-to-threshold:
+\[
+    T_{\alpha}(g;\tau)
+    =
+    \inf\{t: S_\tau(\theta_t^g)\ge \alpha\}.
+\]
+
+A good canonicalizer should reduce $T_\alpha$, improve area under the validation curve, reduce gradient/update outliers, and preserve base capabilities.
+
+% ============================================================
+\section{Core Hypotheses}
+% ============================================================
+
+\paragraph{H1: Gauge choice affects adaptation.}
+AdamW, LoRA, QLoRA, DPO, PPO/GRPO, gradient clipping, and low-bit quantization are coordinate-dependent. Thus two equivalent checkpoints can have measurably different adaptation trajectories.
+
+\paragraph{H2: Activation-gradient balancing is a static natural-gradient proxy.}
+Balancing forward activation covariance and backward gradient covariance inside an exact gauge orbit should improve first-order optimization and low-rank adaptation.
+
+\paragraph{H3: The effect is strongest on hard-to-adapt bases.}
+Canonicalization should matter most for checkpoints whose pretrained parameter geometry is sharp, overtrained, heavily annealed, or poorly matched to downstream adaptation.
+
+\paragraph{H4: Quantized adaptation is especially gauge-sensitive.}
+Quantization is not invariant to gauge choice. A representative whose quantization residual is low-rank-friendly should improve QLoRA convergence and final quality.
+
+% ============================================================
+\section{Exact and Near-Exact Canonicalization Operations}
+% ============================================================
+
+\subsection{Exact value-output gauge in GQA attention}
+
+Consider a decoder-only Transformer layer with grouped-query attention. For KV group $j$ and each query head $h$ in that group, write
+\[
+    v_{t,j}=W_V^{(j)}x_t,
+    \qquad
+    z_{t,h}=\sum_{\tau\le t}a_{t,h,\tau}v_{\tau,j},
+    \qquad
+    y_t=\sum_h W_O^{(h)}z_{t,h}.
+\]
+For each KV group choose $P_j\in\GL(d_h)$ and apply
+\[
+    W_V^{(j)}\leftarrow P_j W_V^{(j)},
+    \qquad
+    W_O^{(h)}\leftarrow W_O^{(h)}P_j^{-1}
+    \quad \forall h: \grp(h)=j.
+\]
+Attention weights are unchanged because they depend on $Q,K$, not $V$. The head output transforms as $z_{t,h}\leftarrow P_j z_{t,h}$, and the output projection cancels it:
+\[
+    W_O^{(h)}P_j^{-1}P_jz_{t,h}=W_O^{(h)}z_{t,h}.
+\]
+Thus this is exact in real arithmetic and should be near-exact under bf16/fp16 if $P_j$ is well-conditioned.
+
+\subsection{Value row whitening}
+
+For each $(\ell,j)$, let $V=W_V^{(\ell,j)}$ and
+\[
+    S_V=(VV^\top+\lambda I)^{1/2}.
+\]
+Set
+\[
+    P=S_V^{-1},
+    \qquad
+    V'=S_V^{-1}V,
+    \qquad
+    O_h'=O_hS_V.
+\]
+Then $V'V'^\top\approx I$. This is a simple baseline, but it can push bad conditioning into $O$.
+
+\subsection{Value-output norm balancing}
+
+Let
+\[
+    A=VV^\top+\lambda I,
+    \qquad
+    B=\sum_{h:\grp(h)=j}O_h^\top O_h+\lambda I.
+\]
+Choose $P$ so that
+\[
+    PAP^\top\approx P^{-\top}BP^{-1}.
+\]
+With $X=P^\top P$, solve
+\[
+    XAX=B.
+\]
+The SPD solution is
+\[
+    X=A^{-1/2}(A^{1/2}BA^{1/2})^{1/2}A^{-1/2},
+    \qquad
+    P=X^{1/2}.
+\]
+This is safer than pure $V$ whitening because it balances the two sides of the exact gauge pair.
+
+\subsection{Value-output activation-gradient Fisher balancing}
+
+Collect forward channel covariance and backward gradient covariance on a small proxy batch:
+\[
+    C=\E[zz^\top]+\lambda I,
+    \qquad
+    F=\E[g_zg_z^\top]+\lambda I.
+\]
+The exact gauge action is
+\[
+    C'=PCP^\top,
+    \qquad
+    F'=P^{-\top}FP^{-1}.
+\]
+Choose $P$ so that $C'=F'$. Equivalently,
+\[
+    XCX=F,
+    \qquad X=P^\top P.
+\]
+The SPD solution is
+\[
+    X=C^{-1/2}(C^{1/2}FC^{1/2})^{1/2}C^{-1/2},
+    \qquad
+    P=X^{1/2}.
+\]
+
+\paragraph{Interpretation.}
+This is a static K-FAC-like balancing step inside an exact function-preserving orbit. It equalizes forward and backward second moments in the channel basis actually used by LoRA and AdamW.
+
+\subsection{LoRA rank-shaping canonicalization}
+
+For a weight matrix $W$ and task loss $L$, the best first-order rank-$r$ update captures the top singular directions of the gradient:
+\[
+    G_r(W)=\left(\sum_{i=1}^r\sigma_i^2(\nabla_WL)\right)^{1/2}.
+\]
+Under the value gauge,
+\[
+    \nabla_{V'}L=P^{-\top}\nabla_VL.
+\]
+A directly LoRA-friendly objective is
+\[
+    P^\star
+    =
+    \argmax_{P:\,\cond(P)\le \kappa_{\max}}
+    \frac{\sum_{i=1}^{r}\sigma_i^2(P^{-\top}G_V)}{\|P^{-\top}G_V\|_F^2}.
+\]
+This objective should be treated as a more aggressive, task-conditioned canonicalizer. It may overfit to the proxy task distribution, so it should be evaluated after the generic activation-gradient version.
+
+\subsection{Exact SwiGLU MLP hidden-channel balancing}
+
+For a SwiGLU block
+\[
+    \mathrm{MLP}(x)=W_d\left(\mathrm{silu}(W_gx)\odot W_ux\right),
+\]
+there is an exact positive hidden-channel scaling symmetry:
+\[
+    W_u[i,:]\leftarrow c_iW_u[i,:],
+    \qquad
+    W_d[:,i]\leftarrow W_d[:,i]/c_i,
+\]
+with $W_g$ unchanged. This scales the hidden product channel by $c_i$ and then cancels it in $W_d$.
+
+A norm-balanced choice is
+\[
+    c_i=\left(\frac{\|W_d[:,i]\|_2}{\|W_u[i,:]\|_2+\epsilon}\right)^{1/2}.
+\]
+A data-aware activation-gradient choice uses hidden channel $h_i=\mathrm{silu}(W_gx)_i(W_ux)_i$ and backpropagated gradient $g_{h,i}$:
+\[
+    c_i=\left(\frac{\E[g_{h,i}^2]+\epsilon}{\E[h_i^2]+\epsilon}\right)^{1/4}.
+\]
+
+\subsection{RMSNorm gamma folding}
+
+For pre-norm layer input
+\[
+    \tilde x=\mathrm{RMSNorm}(x;\gamma)=\gamma\odot \frac{x}{\mathrm{rms}(x)},
+\]
+fold $\gamma$ into downstream linear maps:
+\[
+    W_Q\leftarrow W_Q\operatorname{diag}(\gamma),
+    \quad
+    W_K\leftarrow W_K\operatorname{diag}(\gamma),
+    \quad
+    W_V\leftarrow W_V\operatorname{diag}(\gamma),
+\]
+with analogous folding into MLP input projections. Then set $\gamma\leftarrow \mathbf 1$. This is exact for forward evaluation when the norm output is consumed only by those linear maps. It may interact with optimizer weight decay and tied weights, so it should be used as an ablation, not the first main method.
+
+\subsection{Q/K scale canonicalization under QK-Norm}
+
+Generic $Q/K$ rotations are not safe under RoPE and QK-Norm. However, headwise positive scaling can be near-invariant under RMS/QK normalization:
+\[
+    W_Q^{(h)}\leftarrow c_hW_Q^{(h)},
+    \qquad
+    W_K^{(j)}\leftarrow d_jW_K^{(j)}.
+\]
+Canonicalize so that
+\[
+    \E\|W_Q^{(h)}x\|_2^2/d_h\approx 1,
+    \qquad
+    \E\|W_K^{(j)}x\|_2^2/d_h\approx 1.
+\]
+This is not exact because of $\epsilon$ terms and learned scales. It belongs in a later experiment after exact $V/O$ and MLP gauges.
+
+\subsection{Untied lm-head row-centering}
+
+For untied lm head $z=W_Uh+b$, softmax is invariant to adding a common scalar to all logits. Therefore
+\[
+    W_U\leftarrow W_U-\mathbf 1 a^\top,
+    \qquad
+    a=\frac{1}{V}\sum_{v=1}^V W_U[v,:]
+\]
+preserves the output distribution. Do not apply this if input embeddings and lm head are tied.
+
+\subsection{Gauge-LoftQ: quantization-aware canonicalization}
+
+QLoRA trains LoRA adapters through a frozen 4-bit quantized backbone \cite{dettmers2023qlora}. LoftQ jointly chooses a quantized matrix and low-rank initialization to reduce the quantization discrepancy \cite{li2023loftq}. The gauge extension is:
+\[
+    \min_{g,Q,\Delta_r}\|g\cdot W-Q(g\cdot W)-\Delta_r\|_F^2,
+    \qquad
+    \rank(\Delta_r)\le r.
+\]
+Equivalently, choose $g$ so the quantization residual has high top-$r$ singular energy and is easy for LoRA to compensate.
+
+% ============================================================
+\section{Why This Should Work}
+% ============================================================
+
+\subsection{AdamW is not gauge invariant}
+
+Under $V'=PV$, the gradient transforms as
+\[
+    G_{V'}=P^{-\top}G_V.
+\]
+A true natural-gradient or full-matrix preconditioner could transform covariantly. AdamW uses coordinate-wise second moments and weight decay in the chosen basis, so
+\[
+    \operatorname{AdamW}(P^{-\top}G_V)
+    \neq
+    P\operatorname{AdamW}(G_V)
+\]
+in general. A gauge transformation can therefore act as static preconditioning.
+
+\subsection{LoRA is especially basis-sensitive}
+
+LoRA restricts updates to
+\[
+    \Delta W=BA,
+    \qquad
+    \rank(\Delta W)\le r.
+\]
+The first-order loss decrease available to rank-$r$ updates is controlled by singular value concentration of $\nabla_W L$. Since exact gauges can reshape singular spectra of gradients observed by a module, the same function can be more or less LoRA-friendly.
+
+\subsection{Quantization is not gauge invariant}
+
+For a nonlinear quantizer $Q$,
+\[
+    Q(PW)\neq P Q(W)
+\]
+in general. Thus gauge choice before quantization changes the quantized backbone and the low-rank residual that LoRA must learn. This creates a concrete path to improve QLoRA without modifying the adaptation algorithm.
+
+% ============================================================
+\section{Base Model Selection}
+% ============================================================
+
+Given available compute for 0.6B--1B models, Qwen/Llama small bases should be part of the \emph{main} experimental matrix, not merely external validation. The important distinction is:
+
+\begin{quote}
+The literature-backed hard-to-finetune phenomenon comes from checkpoint state, especially overtraining and LR decay; Qwen3-0.6B-Base and Llama-3.2-1B are modern, compute-feasible substrates on which to measure or induce that hardness.
+\end{quote}
+
+Therefore, the project should use two axes:
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{Modern architecture axis:} Qwen3-0.6B-Base and Llama-3.2-1B provide realistic dense/GQA Transformer testbeds under feasible compute.
+    \item \textbf{Hardness axis:} overtrained checkpoints, LR-decayed checkpoints, and stable-LR vs decay-to-zero continuation twins provide evidence-backed hard-to-adapt checkpoint states.
+\end{enumerate}
+
+Do not claim by default that Qwen or Llama small bases are ``notoriously hard to fine-tune.'' Instead, claim that they are the correct modern architectures to test, and use an operational hardness score to decide whether a specific model-task pair belongs in the main hard-adaptation suite.
+
+\subsection{Operational hardness score}
+
+For model $m$, task $\tau$, budgeted PEFT stack $a$, and strong reference stack $a_{\mathrm{ref}}$, define
+\[
+    H(m,\tau)
+    =
+    1-
+    \frac{S_\tau(a(m))-S_\tau(m)}{S_\tau(a_{\mathrm{ref}}(m))-S_\tau(m)+\epsilon}.
+\]
+A model-task pair is useful if:
+\begin{enumerate}[leftmargin=*]
+    \item the base model has not saturated the benchmark;
+    \item the reference adaptation improves it;
+    \item the cheap/budgeted adaptation struggles, is unstable, or needs many steps;
+    \item the task is not impossible or purely data-contamination-driven.
+\end{enumerate}
+High $H$ means the model is hard for the budgeted fine-tuning stack but still learnable by a stronger reference.
+
+\subsection{Primary model matrix}
+
+\begin{longtable}{>{\raggedright\arraybackslash}p{0.20\linewidth} >{\raggedright\arraybackslash}p{0.36\linewidth} >{\raggedright\arraybackslash}p{0.34\linewidth}}
+\toprule
+Candidate & Why include it & Use in this project \\
+\midrule
+Qwen3-0.6B-Base & Modern 2025 dense Qwen-family base model. The model card lists 0.6B parameters, 28 layers, GQA with 16 query heads and 8 KV heads, and 32k context length \cite{qwen3hf06b}. & First primary model. It is cheap enough for multi-seed LoRA/QLoRA sweeps and directly supports exact $V/O$ GQA canonicalization. Use native checkpoint first, then optionally construct continuation twins. \\
+\addlinespace
+Llama-3.2-1B base & Llama-family 1.23B text-only base with GQA and shared embeddings; the model card lists 1B/3B pretrained and instruction-tuned variants and 128k context for text-only models \cite{llama32hf1b}. & Second primary model. It tests whether effects transfer outside Qwen while staying within a feasible compute envelope. It is also important because many fine-tuning stacks target Llama-style architectures. \\
+\addlinespace
+OLMo-1B overtrained/intermediate checkpoints & Springer et al. report ``catastrophic overtraining'': extended pretraining can improve base performance but hurt final performance after fine-tuning; they specifically compare OLMo-1B token budgets such as 2.3T vs 3T \cite{springer2025overtrained}. OLMo releases code and checkpoints for controlled research \cite{groeneveld2024olmo}. & Literature-backed hardness anchor. Use to avoid the criticism that observed hardness is merely a Qwen/Llama idiosyncrasy or training-loop artifact. \\
+\addlinespace
+Custom Qwen/Llama continuation twins & Yano et al. find that pretraining without LR decay improves downstream SFT and that decay-based schedules can lead to sharper minima and worse adaptability \cite{yano2026wso}. & Strongest causal experiment if compute allows. Continue-pretrain the same base under matched data/tokens: stable LR vs decay-to-zero. Then test whether canonicalization recovers adaptation speed. \\
+\bottomrule
+\end{longtable}
+
+\subsection{Practical ranking}
+
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{First smoke test: Qwen3-0.6B-Base.} It is the cleanest starting point because it is small, modern, GQA-based, and cheap enough for many ablations.
+    \item \textbf{First transfer test: Llama-3.2-1B.} Run the same canonicalizers and LoRA configs. If Qwen improves but Llama does not, the method may be architecture- or implementation-specific.
+    \item \textbf{First hardness anchor: OLMo-1B overtrained/intermediate.} Use this to connect the project to the hard-to-finetune literature.
+    \item \textbf{First causal hardness construction: Qwen3-0.6B continuation twins.} Stable-LR vs decay-to-zero continuation is the most direct way to test your hypothesis about LR decay creating low-plasticity checkpoints.
+\end{enumerate}
+
+\subsection{Model families to de-emphasize in the first paper}
+
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Llama 4 Scout/Maverick:} useful later, but MoE/multimodal details and size make it a confounded first target.
+    \item \textbf{Very large Qwen/Llama variants:} unnecessary until the 0.6B/1B regime shows a robust signal.
+    \item \textbf{Models without clean base checkpoints:} less useful because instruction tuning/RLHF can obscure whether canonicalization is helping adaptation or fighting previous post-training.
+\end{itemize}
+
+% ============================================================
+\section{Synthetic Hard-to-Finetune Checkpoint Construction}
+% ============================================================
+
+The cleanest experiment is to manufacture hard-to-adapt bases under controlled training.
+
+\subsection{Construction}
+
+Start from Qwen3-0.6B-Base or Llama-3.2-1B, or from an OLMo-style checkpoint with accessible training artifacts, and continue pretraining under matched data and token budget:
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{Stable-LR checkpoint:} warmup-stable-only or constant-LR continuation.
+    \item \textbf{Decay-to-zero checkpoint:} same data and compute, but cosine or linear decay to zero.
+    \item \textbf{Overtrained checkpoint:} repeated or extended token budget after the stable model has reached strong pretraining loss.
+\end{enumerate}
+
+For Qwen/Llama, the continuation budget does not need to be large enough to produce a new strong base model. The goal is to create matched checkpoint states with different plasticity while holding architecture, tokenizer, and data fixed. Qwen3-0.6B-Base is the most convenient first target because its GQA geometry is small enough for exhaustive canonicalizer ablations.
+
+The key comparison is not just base perplexity. The key comparison is downstream adaptivity:
+\[
+    \text{lower pretraining loss may coexist with worse post-SFT performance.}
+\]
+
+\subsection{Hypothesis}
+
+Decay-to-zero or overtraining moves the model into a sharper, more sensitive, less adapter-friendly representative or basin. Canonicalization cannot change the function-level basin, but it may improve the coordinate geometry seen by finite-budget adaptation.
+
+\subsection{Controls}
+
+\begin{enumerate}[leftmargin=*]
+    \item Match tokenizer, architecture, data, and total tokens.
+    \item Evaluate base perplexity and base benchmark scores before adaptation.
+    \item Run full LR sweeps for LoRA/QLoRA so canonicalization is not merely changing the optimal learning rate.
+    \item Include random gauges with the same condition-number constraints as negative controls.
+    \item Include full SFT or high-rank LoRA as an upper reference.
+\end{enumerate}
+
+% ============================================================
+\section{Task and Benchmark Selection}
+% ============================================================
+
+The task suite should be standard, diverse, and still relevant in 2025+. It should avoid tasks where ordinary SFT is known to be nearly hopeless or where the base model has already saturated the benchmark.
+
+\subsection{Primary adaptation tasks}
+
+\begin{longtable}{>{\raggedright\arraybackslash}p{0.16\linewidth} >{\raggedright\arraybackslash}p{0.30\linewidth} >{\raggedright\arraybackslash}p{0.34\linewidth} >{\raggedright\arraybackslash}p{0.12\linewidth}}
+\toprule
+Domain & Train data & Evaluation & Role \\
+\midrule
+Math reasoning & OpenMathReasoning, NuminaMath-CoT, or a decontaminated subset. OpenMathReasoning is a 2025 large-scale math reasoning dataset with hundreds of thousands to millions of math solutions depending on version \cite{moshkov2025openmathreasoning}. & AIME 2024/2025/2026 when available, MATH-500, possibly Omni-MATH. MATH is a 12.5K competition-math dataset and MATH-500 is a common 500-problem evaluation subset \cite{hendrycks2021math}. & Primary \\
+\addlinespace
+Code generation & MBPP train/sanitized train, CodeFeedback-Filtered-Instruction, Magicoder-style code instruction data. & MBPP/MBPP+, LiveCodeBench, BigCodeBench. MBPP has 974 entry-level Python tasks \cite{austin2021mbpp}; LiveCodeBench continuously collects fresh contest problems to reduce contamination \cite{jain2024livecodebench}; BigCodeBench targets more realistic and complex function-call-heavy code tasks \cite{zhuo2024bigcodebench}. & Primary \\
+\addlinespace
+Instruction following & Tulu-3 SFT mixture or a small high-quality instruction mixture. Tulu 3 provides open post-training data, code, and recipes \cite{lambert2024tulu3}. & IFEval, AlpacaEval 2, internal format-following tests. IFEval uses verifiable natural-language constraints and around 500 prompts \cite{zhou2023ifeval}. & Primary \\
+\addlinespace
+Tool/function calling & BFCL/OpenFunctions-style data or tool-call instruction data. & BFCL V4 or current BFCL. BFCL evaluates tool/function calling across real-world function-use settings and is periodically updated \cite{patil2025bfcl}. & Primary/optional \\
+\bottomrule
+\end{longtable}
+
+\subsection{Secondary generalization and non-forgetting checks}
+
+\begin{itemize}[leftmargin=*]
+    \item \textbf{MMLU-Pro:} use as a robustness/general-knowledge reasoning check, not necessarily as the main SFT-improvement target. MMLU-Pro is designed to be more challenging and reasoning-intensive than MMLU, with 10 answer options and over 12K questions across 14 domains \cite{wang2024mmlupro}.
+    \item \textbf{GPQA-Diamond:} use as a hard scientific reasoning check. GPQA contains expert-written graduate-level biology, physics, and chemistry questions \cite{rein2023gpqa}. It may be too hard for ordinary SFT to improve reliably, so treat it as secondary.
+    \item \textbf{LiveBench:} use as a contamination-aware aggregate check, because it is updated and scores with objective ground truth \cite{white2024livebench}.
+\end{itemize}
+
+\subsection{Task inclusion rule}
+
+For every candidate task $\tau$, first run a pilot:
+\[
+    S_{\mathrm{base}},
+    \quad
+    S_{\mathrm{LoRA}},
+    \quad
+    S_{\mathrm{full/high\text{-}rank}}.
+\]
+Include $\tau$ in the main suite only if
+\[
+    S_{\mathrm{full/high\text{-}rank}}-S_{\mathrm{base}}\ge \Delta_{\min}
+\]
+and the benchmark is not saturated. If both LoRA and full/reference SFT fail to improve it, use it only as a non-forgetting metric.
+
+% ============================================================
+\section{Experimental Matrix}
+% ============================================================
+
+\subsection{Canonicalizers}
+
+\begin{enumerate}[leftmargin=*]
+    \item Original checkpoint.
+    \item Random exact gauge with matched condition-number clipping.
+    \item $V$ row whitening.
+    \item $V/O$ norm balancing.
+    \item $V/O$ activation-gradient balancing.
+    \item MLP norm balancing.
+    \item MLP activation-gradient balancing.
+    \item Combined exact canonicalization: $V/O$ + MLP.
+    \item Gauge-LoftQ for QLoRA.
+    \item Optional near-exact Q/K scale canonicalization.
+\end{enumerate}
+
+\subsection{Adaptation stacks}
+
+\begin{enumerate}[leftmargin=*]
+    \item LoRA on $W_V$ only.
+    \item LoRA on $W_V,W_O$.
+    \item LoRA on attention projections.
+    \item All-linear LoRA.
+    \item QLoRA all-linear.
+    \item PiSSA/DoRA baselines.
+    \item Full SFT or high-rank LoRA as upper reference.
+\end{enumerate}
+
+PiSSA and DoRA are useful because they are stronger PEFT baselines: PiSSA changes LoRA initialization using principal singular components \cite{meng2024pissa}, while DoRA decomposes pretrained weights into magnitude and direction and applies LoRA to directional updates \cite{liu2024dora}.
+
+\subsection{Metrics}
+
+For SFT/LoRA/QLoRA:
+\begin{itemize}[leftmargin=*]
+    \item validation loss vs steps;
+    \item benchmark score vs steps;
+    \item area under learning curve;
+    \item steps to threshold;
+    \item best score under fixed compute;
+    \item gradient norm variance;
+    \item update norm distribution;
+    \item LoRA factor norm growth;
+    \item top-$r$ singular energy of module gradients;
+    \item base benchmark preservation.
+\end{itemize}
+
+For RL/DPO/PPO/GRPO:
+\begin{itemize}[leftmargin=*]
+    \item reward vs updates;
+    \item KL to reference vs updates;
+    \item KL-per-reward-gain;
+    \item clip fraction;
+    \item entropy;
+    \item instability/divergence rate;
+    \item final score under equal sample budget.
+\end{itemize}
+
+For QLoRA:
+\begin{itemize}[leftmargin=*]
+    \item quantization reconstruction error;
+    \item residual singular spectrum;
+    \item fraction of quantization residual captured by rank $r$;
+    \item downstream score vs steps;
+    \item post-merge quality if merging adapters.
+\end{itemize}
+
+% ============================================================
+\section{Implementation Plan}
+% ============================================================
+
+\subsection{Phase 0: infrastructure and invariance tests}
+
+\begin{enumerate}[leftmargin=*]
+    \item Implement checkpoint rewrite utilities for $V/O$ and MLP hidden scaling.
+    \item Verify fp32 exact invariance by comparing logits before and after transformation.
+    \item Verify bf16/fp16 drift on calibration prompts.
+    \item Add singular-value clipping:
+    \[
+        \sigma(P)\in[\sigma_{\min},\sigma_{\max}].
+    \]
+    \item Save canonicalization metadata for reversibility and ablation.
+\end{enumerate}
+
+\subsection{Phase 1: exact $V/O$ activation-gradient canonicalization}
+
+For each layer $\ell$ and KV group $j$:
+\begin{enumerate}[leftmargin=*]
+    \item Run proxy batches through the model.
+    \item Hook value-path channel activations $z_{\ell,j}$.
+    \item Backpropagate proxy loss and hook gradients $g_{z_{\ell,j}}$.
+    \item Estimate
+    \[
+        C_{\ell,j}=\E[zz^\top]+\lambda I,
+        \qquad
+        F_{\ell,j}=\E[g_zg_z^\top]+\lambda I.
+    \]
+    \item Solve
+    \[
+        X_{\ell,j}C_{\ell,j}X_{\ell,j}=F_{\ell,j},
+        \qquad
+        P_{\ell,j}=X_{\ell,j}^{1/2}.
+    \]
+    \item Clip $P_{\ell,j}$, apply $W_V\leftarrow PW_V$ and $W_O\leftarrow W_OP^{-1}$.
+\end{enumerate}
+
+\subsection{Phase 2: exact MLP hidden-channel balancing}
+
+For each SwiGLU block:
+\begin{enumerate}[leftmargin=*]
+    \item Hook hidden channel $h_i=\mathrm{silu}(W_gx)_i(W_ux)_i$.
+    \item Hook gradient $g_{h,i}$.
+    \item Estimate
+    \[
+        c_i=\left(\frac{\E[g_{h,i}^2]+\epsilon}{\E[h_i^2]+\epsilon}\right)^{1/4}.
+    \]
+    \item Clip $c_i\in[c_{\min},c_{\max}]$.
+    \item Apply $W_u[i,:]\leftarrow c_iW_u[i,:]$ and $W_d[:,i]\leftarrow W_d[:,i]/c_i$.
+\end{enumerate}
+
+\subsection{Phase 3: modern-base and hard-checkpoint pilots}
+
+\begin{enumerate}[leftmargin=*]
+    \item Start with Qwen3-0.6B-Base and Llama-3.2-1B because they fit the available compute budget.
+    \item Run constrained PEFT pilots: rank $r\in\{4,8,16,32\}$, module subsets, QLoRA vs bf16 LoRA, and small data budgets.
+    \item Compute hardness score $H(m,\tau)$ for math/code/instruction tasks.
+    \item For the most promising family, construct continuation twins: stable-LR vs decay-to-zero, matched data, matched tokens.
+    \item Add OLMo overtraining checkpoints if available, because they provide the strongest literature-backed hard-adaptation evidence.
+    \item Select 2--3 model-task pairs with high hardness and reference learnability.
+\end{enumerate}
+
+\subsection{Phase 4: main experiments}
+
+Run the full canonicalizer matrix on selected hard model-task pairs. Use at least 3 seeds and a small LR grid per method. If canonicalization only shifts the optimal learning rate, it is not enough for a strong claim.
+
+\subsection{Phase 5: QLoRA/Gauge-LoftQ}
+
+Measure whether gauge choice before 4-bit quantization makes the quantization residual more rank-$r$ recoverable and improves QLoRA. Compare against vanilla QLoRA and LoftQ.
+
+% ============================================================
+\section{Main Ablations and Failure Modes}
+% ============================================================
+
+\subsection{Ablations}
+
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{Random gauge control:} same condition number as the proposed gauge.
+    \item \textbf{Weight-only vs data-aware:} compare norm balancing to activation-gradient balancing.
+    \item \textbf{Forward-only vs backward-aware:} compare $C$ whitening, $F$ whitening, and $C/F$ balancing.
+    \item \textbf{Module locality:} attention-only, MLP-only, combined.
+    \item \textbf{Optimizer dependence:} AdamW vs stronger matrix-aware optimizers if feasible.
+    \item \textbf{LR sweep:} ensure gains persist under tuned learning rates.
+    \item \textbf{Rank sweep:} LoRA ranks $r\in\{4,8,16,32,64\}$.
+\end{enumerate}
+
+\subsection{Likely failure modes}
+
+\paragraph{Learning-rate confounding.}
+Canonicalization may simply rescale gradients and shift the best LR. Mitigation: LR sweeps and learning-rate-normalized comparisons.
+
+\paragraph{Proxy-task overfitting.}
+Rank-shaping can overfit to the proxy gradients. Mitigation: keep activation-gradient balancing as the main generic method and evaluate cross-task transfer.
+
+\paragraph{Numerical drift.}
+Large $P$ can be exact in fp32 but unstable in bf16/fp16/int4. Mitigation: condition-number clipping and drift thresholds.
+
+\paragraph{No effect under strong optimizers.}
+If Shampoo/SOAP/Muon-style optimizers remove the gain, that is still informative: the method is a cheap static substitute for expensive preconditioning.
+
+\paragraph{Task non-learnability.}
+Some benchmarks are common but not good SFT targets. Mitigation: pilot inclusion rule and use hard benchmarks as secondary non-forgetting checks.
+
+% ============================================================
+\section{Expected Paper Claim}
+% ============================================================
+
+A clean paper claim:
+
+\begin{quote}
+\textbf{Function-preserving canonicalization of Transformer checkpoints improves finite-budget adaptation because practical fine-tuning algorithms are coordinate-dependent.}
+\end{quote}
+
+Possible title:
+
+\begin{quote}
+\textbf{CanonFT: Finetuning-Friendly Canonicalization of Transformer Checkpoints}
+\end{quote}
+
+Alternative title:
+
+\begin{quote}
+\textbf{GaugeFix: Choosing Adapter-Friendly Representatives of Pretrained Transformers}
+\end{quote}
+
+\subsection{Contributions}
+
+\begin{enumerate}[leftmargin=*]
+    \item Formalize finetuning-friendly canonicalization as static preconditioning over a functionality-preserving gauge orbit.
+    \item Derive exact value-output activation-gradient balancing for GQA attention.
+    \item Derive exact SwiGLU hidden-channel activation-gradient balancing.
+    \item Introduce gauge-aware QLoRA/LoftQ as low-rank-friendly quantization residual shaping.
+    \item Evaluate on literature-backed and synthetically constructed hard-to-adapt base checkpoints.
+    \item Show improvements in sample efficiency, stability, and fixed-budget performance across math, code, instruction following, and possibly function calling.
+\end{enumerate}
+
+% ============================================================
+\section{Go/No-Go Criteria}
+% ============================================================
+
+\subsection{Green-light result}
+
+Proceed to paper if at least two exact canonicalizers satisfy:
+\begin{enumerate}[leftmargin=*]
+    \item negligible initial drift;
+    \item robust improvement after LR sweep;
+    \item improvement on at least two domains or two model families;
+    \item interpretable geometry change, e.g. better gradient rank concentration or lower update variance;
+    \item no major degradation on secondary non-forgetting benchmarks.
+\end{enumerate}
+
+A strong target is:
+\[
+    \text{5--20\% fewer steps to threshold}
+\]
+or
+\[
+    \text{1--3 absolute points fixed-budget improvement}
+\]
+on at least one meaningful benchmark, after tuning baselines fairly.
+
+\subsection{No-go result}
+
+Do not pursue the paper if:
+\begin{enumerate}[leftmargin=*]
+    \item all gains disappear under LR sweeps;
+    \item gains occur only for one fragile module choice;
+    \item bf16/fp16 drift is too large;
+    \item random gauges perform as well as proposed canonicalizers;
+    \item the only improvements are on benchmarks where the base model was already saturated or where reference SFT also fails.
+\end{enumerate}
+
+% ============================================================
+\section{Minimal First Experiment}
+% ============================================================
+
+The minimal experiment should now use the feasible 0.6B--1B models directly, rather than treating them as late external-validation models.
+
+\subsection{Stage 0: static invariance and geometry check}
+
+\begin{enumerate}[leftmargin=*]
+    \item Model: Qwen3-0.6B-Base first; then Llama-3.2-1B. Add Qwen2.5-0.5B/1.5B only if a pure-pretraining Qwen control is needed.
+    \item Canonicalizers: original, random gauge with matched condition number, $V/O$ norm balancing, $V/O$ activation-gradient balancing, MLP activation-gradient balancing, combined.
+    \item Safety metrics: fp32 logit MSE, bf16 token-level KL, perplexity delta, top-$k$ token disagreement, and generation-level sanity prompts.
+    \item Geometry metrics: $\cond(C)$, $\cond(F)$, $\cond(C^{1/2}FC^{1/2})$, top-$r$ gradient energy, LoRA factor norm growth, and update-norm variance.
+\end{enumerate}
+
+\subsection{Stage 1: cheap main SFT signal}
+
+\begin{enumerate}[leftmargin=*]
+    \item Model: Qwen3-0.6B-Base.
+    \item Task: math SFT on a decontaminated OpenMathReasoning/NuminaMath subset; evaluate MATH-500 and AIME 2024/2025.
+    \item Fine-tuning: all-linear LoRA with ranks 8, 32, and 64; small LR sweep; 3 seeds.
+    \item Metrics: validation loss curve, MATH-500, AIME, steps-to-threshold, AUC-over-budget, top-$r$ gradient energy, bf16 drift.
+\end{enumerate}
+
+This should be the first go/no-go. If $V/O$ activation-gradient balancing and/or MLP balancing does not produce any robust learning-curve improvement after LR sweep, the project is weak as a generic SFT preconditioning story.
+
+\subsection{Stage 2: cross-family validation}
+
+Repeat the strongest Stage-1 setting on:
+\begin{enumerate}[leftmargin=*]
+    \item Llama-3.2-1B, as the Llama-style GQA check;
+    \item optionally Qwen2.5-0.5B/1.5B base, as a pure-pretraining Qwen control;
+    \item optionally Qwen3-1.7B-Base, as the same-family scale-up.
+\end{enumerate}
+
+Do not require all models to improve. A realistic target is improvement on Qwen3 plus one cross-family model, with random-gauge controls failing.
+
+\subsection{Stage 3: hard-to-finetune construction}
+
+Construct a matched pair by continuing pretraining one model, preferably Qwen3-0.6B-Base:
+\begin{enumerate}[leftmargin=*]
+    \item stable-LR continuation;
+    \item cosine or linear decay-to-zero continuation;
+    \item optionally overtrained continuation beyond the normal stopping point.
+\end{enumerate}
+
+Then compare adaptation under original versus canonicalized representatives. This is the cleanest test of the central hypothesis:
+\[
+    \text{canonicalization helps most when the base is less plastic under ordinary fine-tuning.}
+\]
+
+\subsection{Stage 4: QLoRA/Gauge-LoftQ}
+
+If SFT signal is present, run QLoRA with NF4 or comparable 4-bit quantization. Compare ordinary QLoRA, LoftQ-style initialization, and Gauge-LoftQ. The key metric is not only quantization error but whether the residual is low-rank-adapter-friendly:
+\[
+    \frac{\sum_{i\le r}\sigma_i^2(W-Q(W))}{\|W-Q(W)\|_F^2}.
+\]
+
+If Stage 1 and Stage 4 both fail, the project is likely not worth scaling.
+
+% ============================================================
+\section{Summary}
+% ============================================================
+
+\begin{itemize}[leftmargin=*]
+    \item The project should be purely about canonicalization for easier adaptation, not anti-finetuning.
+    \item The main theoretical object is a functionality-preserving gauge orbit.
+    \item The main practical claim is static preconditioning for coordinate-dependent optimizers and adapters.
+    \item The first method should be exact $V/O$ activation-gradient balancing.
+    \item The second method should be exact SwiGLU hidden-channel balancing.
+    \item The third method should be gauge-aware QLoRA/LoftQ.
+    \item Given available compute, Qwen3-0.6B-Base and Llama-3.2-1B should be main experimental models rather than merely external-validity models.
+    \item The most defensible hard-to-finetune evidence still comes from overtrained or LR-decayed checkpoints, so the cleanest plan is to induce hardness via continuation twins on small modern bases.
+    \item The main tasks should be math, code, instruction following, and optionally function calling; GPQA/MMLU-Pro/LiveBench are better as secondary robustness checks unless pilot SFT shows clear learnability.
+\end{itemize}
+
+% ============================================================
+\begin{thebibliography}{99}
+
+\bibitem{springer2025overtrained}
+Jacob Mitchell Springer, Sachin Goyal, Kaiyue Wen, Tanishq Kumar, Xiang Yue, Sadhika Malladi, Graham Neubig, and Aditi Raghunathan.
+\newblock Overtrained Language Models Are Harder to Fine-Tune.
+\newblock arXiv:2503.19206, 2025.
+\newblock \url{https://arxiv.org/abs/2503.19206}
+
+\bibitem{yano2026wso}
+Kazuki Yano, Shun Kiyono, Sosuke Kobayashi, Sho Takase, and Jun Suzuki.
+\newblock Pre-training LLM without Learning Rate Decay Enhances Supervised Fine-Tuning.
+\newblock arXiv:2603.16127, 2026.
+\newblock \url{https://arxiv.org/abs/2603.16127}
+
+\bibitem{rofin2026lr}
+Mark Rofin, Aditya Varre, and Nicolas Flammarion.
+\newblock (How) Learning Rates Regulate Catastrophic Overtraining.
+\newblock arXiv:2604.13627, 2026.
+\newblock \url{https://arxiv.org/abs/2604.13627}
+
+\bibitem{groeneveld2024olmo}
+Dirk Groeneveld et al.
+\newblock OLMo: Accelerating the Science of Language Models.
+\newblock 2024.
+\newblock \url{https://allenai.org/blog/olmo-open-language-model-87ccfc95f580}
+
+\bibitem{yang2025qwen3}
+An Yang et al.
+\newblock Qwen3 Technical Report.
+\newblock arXiv:2505.09388, 2025.
+\newblock \url{https://arxiv.org/abs/2505.09388}
+
+\bibitem{qwen3hf06b}
+Qwen Team.
+\newblock Qwen3-0.6B-Base model card.
+\newblock Hugging Face, 2025.
+\newblock \url{https://huggingface.co/Qwen/Qwen3-0.6B-Base}
+
+\bibitem{llama32hf1b}
+Meta.
+\newblock Llama-3.2-1B model card.
+\newblock Hugging Face, 2024.
+\newblock \url{https://huggingface.co/meta-llama/Llama-3.2-1B}
+
+\bibitem{gemma3docs}
+Google and Hugging Face Transformers.
+\newblock Gemma 3 model documentation.
+\newblock 2025.
+\newblock \url{https://huggingface.co/docs/transformers/model_doc/gemma3}
+
+\bibitem{llama4hf}
+Hugging Face.
+\newblock Welcome Llama 4 Maverick and Scout on Hugging Face.
+\newblock 2025.
+\newblock \url{https://huggingface.co/blog/llama4-release}
+
+\bibitem{hendrycks2021math}
+Dan Hendrycks, Collin Burns, Saurav Kadavath, Akul Arora, Steven Basart, Eric Tang, Dawn Song, and Jacob Steinhardt.
+\newblock Measuring Mathematical Problem Solving With the MATH Dataset.
+\newblock NeurIPS Datasets and Benchmarks, 2021.
+\newblock \url{https://arxiv.org/abs/2103.03874}
+
+\bibitem{moshkov2025openmathreasoning}
+Igor Moshkov et al.
+\newblock AIMO-2 Winning Solution: Building State-of-the-Art Mathematical Reasoning Models with OpenMathReasoning Dataset.
+\newblock arXiv:2504.16891, 2025.
+\newblock \url{https://arxiv.org/abs/2504.16891}
+
+\bibitem{austin2021mbpp}
+Jacob Austin et al.
+\newblock Program Synthesis with Large Language Models.
+\newblock arXiv:2108.07732, 2021.
+\newblock \url{https://arxiv.org/abs/2108.07732}
+
+\bibitem{jain2024livecodebench}
+Naman Jain et al.
+\newblock LiveCodeBench: Holistic and Contamination Free Evaluation of Large Language Models for Code.
+\newblock arXiv:2403.07974, 2024.
+\newblock \url{https://arxiv.org/abs/2403.07974}
+
+\bibitem{zhuo2024bigcodebench}
+Terry Yue Zhuo et al.
+\newblock BigCodeBench: Benchmarking Code Generation with Diverse Function Calls and Complex Instructions.
+\newblock arXiv:2406.15877, 2024.
+\newblock \url{https://arxiv.org/abs/2406.15877}
+
+\bibitem{zhou2023ifeval}
+Jeffrey Zhou, Tianjian Lu, Swaroop Mishra, Siddhartha Brahma, Sujoy Basu, Yi Luan, Denny Zhou, and Le Hou.
+\newblock Instruction-Following Evaluation for Large Language Models.
+\newblock arXiv:2311.07911, 2023.
+\newblock \url{https://arxiv.org/abs/2311.07911}
+
+\bibitem{lambert2024tulu3}
+Nathan Lambert et al.
+\newblock Tulu 3: Pushing Frontiers in Open Language Model Post-Training.
+\newblock arXiv:2411.15124, 2024.
+\newblock \url{https://arxiv.org/abs/2411.15124}
+
+\bibitem{patil2025bfcl}
+Shishir G. Patil et al.
+\newblock The Berkeley Function Calling Leaderboard (BFCL): From Tool Use to Agentic Evaluation of Large Language Models.
+\newblock ICML, 2025.
+\newblock \url{https://proceedings.mlr.press/v267/patil25a.html}
+
+\bibitem{wang2024mmlupro}
+Yubo Wang et al.
+\newblock MMLU-Pro: A More Robust and Challenging Multi-Task Language Understanding Benchmark.
+\newblock NeurIPS Datasets and Benchmarks, 2024.
+\newblock \url{https://arxiv.org/abs/2406.01574}
+
+\bibitem{rein2023gpqa}
+David Rein et al.
+\newblock GPQA: A Graduate-Level Google-Proof Q\&A Benchmark.
+\newblock arXiv:2311.12022, 2023.
+\newblock \url{https://arxiv.org/abs/2311.12022}
+
+\bibitem{white2024livebench}
+Colin White et al.
+\newblock LiveBench: A Challenging, Contamination-Limited LLM Benchmark.
+\newblock arXiv:2406.19314, 2024.
+\newblock \url{https://arxiv.org/abs/2406.19314}
+
+\bibitem{dettmers2023qlora}
+Tim Dettmers, Artidoro Pagnoni, Ari Holtzman, and Luke Zettlemoyer.
+\newblock QLoRA: Efficient Finetuning of Quantized LLMs.
+\newblock arXiv:2305.14314, 2023.
+\newblock \url{https://arxiv.org/abs/2305.14314}
+
+\bibitem{li2023loftq}
+Yuhang Li et al.
+\newblock LoftQ: LoRA-Fine-Tuning-Aware Quantization for Large Language Models.
+\newblock arXiv:2310.08659, 2023.
+\newblock \url{https://arxiv.org/abs/2310.08659}
+
+\bibitem{meng2024pissa}
+Fanxu Meng, Zhaohui Wang, and Muhan Zhang.
+\newblock PiSSA: Principal Singular Values and Singular Vectors Adaptation of Large Language Models.
+\newblock arXiv:2404.02948, 2024.
+\newblock \url{https://arxiv.org/abs/2404.02948}
+
+\bibitem{liu2024dora}
+Shih-Yang Liu et al.
+\newblock DoRA: Weight-Decomposed Low-Rank Adaptation.
+\newblock ICML, 2024.
+\newblock \url{https://arxiv.org/abs/2402.09353}
+
+\end{thebibliography}
+
+\end{document}

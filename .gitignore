@@ -1,0 +1,25 @@
+# experiment outputs and cluster logs
+results/
+logs/
+
+# python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# claude code transient state
+.claude/
+
+# editor / OS noise
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# virtualenv (if a uv/venv migration happens later)
+.venv/
+venv/
+
+# misc
+*.bak
+*.tmp
