@@ -12,7 +12,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainerCa
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from gsm8k_lora_smoke import apply_canonicalizer
+from gsm8k_lora_smoke import CANONICALIZER_CHOICES, apply_canonicalizer
 
 
 def parse_step_list(spec: str) -> list[int]:
@@ -142,17 +142,7 @@ def main() -> None:
     parser.add_argument("--out-dir", required=True)
     parser.add_argument(
         "--canonicalizer",
-        choices=[
-            "original",
-            "vo_norm",
-            "mlp_norm",
-            "combined",
-            "actgrad_vo",
-            "actgrad_mlp",
-            "actgrad_combined",
-            "actgrad_mlp_gmean",
-            "actgrad_combined_gmean",
-        ],
+        choices=CANONICALIZER_CHOICES,
         default="original",
     )
     parser.add_argument("--math-configs", default=",".join(DEFAULT_MATH_CONFIGS))

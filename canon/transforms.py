@@ -21,8 +21,15 @@ class BalanceRecord:
     balance_rel_before: float
     balance_rel_after: float
     clipped: bool
+    # Optional fields populated when applicable (orthogonal canon defines all four;
+    # SPD canon currently leaves them at None to keep the existing schema stable).
+    commutator_rel_before: float | None = None
+    commutator_rel_after: float | None = None
+    subspace_overlap_before: float | None = None
+    subspace_overlap_after: float | None = None
+    ortho_residual: float | None = None
 
-    def to_dict(self) -> dict[str, float | int | str | bool]:
+    def to_dict(self) -> dict[str, float | int | str | bool | None]:
         return asdict(self)
 
 
@@ -48,6 +55,86 @@ def _cond_from_evals(evals: torch.Tensor) -> float:
 def _relative_gap(a: torch.Tensor, b: torch.Tensor) -> float:
     denom = torch.linalg.norm(a, ord="fro") + torch.linalg.norm(b, ord="fro") + 1e-30
     return float((torch.linalg.norm(a - b, ord="fro") / denom).item())
+
+
+def _commutator_rel(a: torch.Tensor, b: torch.Tensor) -> float:
+    """||A B - B A||_F / (||A||_F * ||B||_F + eps). Measures co-diagonalizability."""
+    denom = float((torch.linalg.norm(a, ord="fro") * torch.linalg.norm(b, ord="fro")).item()) + 1e-30
+    return float(torch.linalg.norm(a @ b - b @ a, ord="fro").item()) / denom
+
+
+def _subspace_overlap(a: torch.Tensor, b: torch.Tensor, k: int | None = None) -> float:
+    """Mean squared cosine of principal angles between the top-k eigensubspaces of A and B.
+
+    1.0 = subspaces identical; 0.0 = orthogonal. k defaults to head_dim // 2.
+    """
+    d = a.shape[0]
+    if k is None:
+        k = max(1, d // 2)
+    _, U_a = torch.linalg.eigh(_sym(a))
+    _, U_b = torch.linalg.eigh(_sym(b))
+    # eigh returns ascending; we want top-k (largest eigenvalues, last k columns)
+    Ua_top = U_a[:, -k:]
+    Ub_top = U_b[:, -k:]
+    M = Ua_top.T @ Ub_top  # (k, k)
+    return float((torch.linalg.norm(M, ord="fro") ** 2 / k).item())
+
+
+def solve_orthogonal_balancer(
+    left: torch.Tensor,
+    right: torch.Tensor,
+) -> tuple[torch.Tensor, dict[str, float | bool]]:
+    """Find orthogonal P that aligns eigenbasis of ``left`` onto eigenbasis of ``right``.
+
+    Both inputs are SPD head_dim x head_dim Gram matrices. The function-preserving
+    gauge ``V <- P V, O <- O P^T`` is restricted to orthogonal P, which always
+    preserves head-dim RMS norms (so it survives v_norm with `with_scale=False`).
+
+    The chosen ``P`` is Procrustes-style: ``P = U_B S U_A^T`` where U_A, U_B are
+    the descending-eigenvalue eigenbases of left/right and S is a sign diagonal
+    chosen to make ``det(P) = +1`` so that consecutive applications compose
+    without reflection.
+    """
+    A = _sym(left.double())
+    B = _sym(right.double())
+    evals_a, U_a = _spd_eigh(A)
+    evals_b, U_b = _spd_eigh(B)
+    # _spd_eigh returns ascending — flip to descending
+    U_a = U_a.flip(-1)
+    U_b = U_b.flip(-1)
+    evals_a = evals_a.flip(-1)
+    evals_b = evals_b.flip(-1)
+
+    # Raw Procrustes: P = U_b U_a^T maps A's eigenbasis to B's eigenbasis with matched ordering.
+    P = U_b @ U_a.T
+    # Pin det(P) = +1 (proper rotation, no reflection) by flipping one column sign of U_b
+    # if needed. Reflection is also orthogonal and function-preserving, but using a proper
+    # rotation makes records like cond_transform reliably equal to 1.
+    if float(torch.linalg.det(P).item()) < 0:
+        U_b_fixed = U_b.clone()
+        U_b_fixed[:, -1] = -U_b_fixed[:, -1]
+        P = U_b_fixed @ U_a.T
+
+    # Sanity: how close is P to truly orthogonal (should be machine eps in fp64).
+    d = P.shape[0]
+    ortho_residual = float((P @ P.T - torch.eye(d, dtype=P.dtype)).norm().item())
+
+    A_new = P @ A @ P.T
+    return P, {
+        "cond_left": _cond_from_evals(evals_a),
+        "cond_right": _cond_from_evals(evals_b),
+        "cond_transform": 1.0,  # orthogonal P has unit singular values
+        "sv_min": 1.0,
+        "sv_max": 1.0,
+        "clipped": False,
+        "ortho_residual": ortho_residual,
+        "frob_gap_before": _relative_gap(A, B),
+        "frob_gap_after": _relative_gap(A_new, B),  # invariant under conjugation by same P
+        "subspace_overlap_before": _subspace_overlap(A, B),
+        "subspace_overlap_after": _subspace_overlap(A_new, B),
+        "commutator_rel_before": _commutator_rel(A, B),
+        "commutator_rel_after": _commutator_rel(A_new, B),
+    }
 
 
 def solve_spd_balancer(
@@ -230,6 +317,107 @@ def apply_gqa_value_output_norm_balance(
 
 
 @torch.no_grad()
+def apply_gqa_value_output_orthogonal_balance(
+    model,
+    *,
+    lambda_scale: float = 1e-6,
+    skip_kv_shared: bool = True,
+) -> list[BalanceRecord]:
+    """Orthogonal V/O canon: V <- P V, O <- O P^T with P proper-rotation.
+
+    Function-preserving even when v_norm is applied along head_dim with no scale
+    (Gemma-3n / Gemma-4 case). The chosen P is Procrustes-style, aligning the
+    eigenbasis of V V^T to that of sum_h O_h^T O_h. Spectra are unitarily
+    invariant under this gauge, so the Frobenius gap ||A-B||_F is unchanged --
+    the metrics that move are commutator_rel and subspace_overlap.
+
+    ``skip_kv_shared`` skips layers whose attention reuses K/V from an earlier
+    layer (Gemma-3n attribute ``self_attn.is_kv_shared_layer``); their v_proj
+    weights are dead at inference and applying canon on them would conflict with
+    the canon already applied to the source layer's v_proj. Layers without this
+    attribute are always processed.
+    """
+    cfg = model.config
+    num_heads = int(cfg.num_attention_heads)
+    num_kv_heads = int(cfg.num_key_value_heads)
+    head_dim = int(getattr(cfg, "head_dim", cfg.hidden_size // num_heads))
+    heads_per_kv = num_heads // num_kv_heads
+    if num_heads % num_kv_heads != 0:
+        raise ValueError(f"num_attention_heads={num_heads} is not divisible by num_key_value_heads={num_kv_heads}")
+
+    records: list[BalanceRecord] = []
+    for layer_idx, layer in enumerate(get_decoder_layers(model)):
+        attn = layer.self_attn
+        if skip_kv_shared and bool(getattr(attn, "is_kv_shared_layer", False)):
+            continue
+        v_weight = attn.v_proj.weight
+        o_weight = attn.o_proj.weight
+        device = v_weight.device
+        out_dtype = v_weight.dtype
+        # Per-layer head_dim (Gemma-3n / Gemma-4 vary head_dim between sliding /
+        # full attention layers). Derive it from v_proj's first dim so we don't
+        # have to consult ``layer_types`` here.
+        layer_head_dim = v_weight.shape[0] // num_kv_heads
+        layer_q_head_dim = o_weight.shape[1] // num_heads
+        if layer_head_dim != layer_q_head_dim:
+            raise ValueError(
+                f"layer {layer_idx}: v_proj head_dim {layer_head_dim} != o_proj head_dim {layer_q_head_dim}"
+            )
+
+        for kv_idx in range(num_kv_heads):
+            v_rows = slice(kv_idx * layer_head_dim, (kv_idx + 1) * layer_head_dim)
+            V = v_weight[v_rows, :].detach().double().cpu()
+            o_blocks = []
+            for local_head in range(heads_per_kv):
+                head_idx = kv_idx * heads_per_kv + local_head
+                o_cols = slice(head_idx * layer_head_dim, (head_idx + 1) * layer_head_dim)
+                o_blocks.append(o_weight[:, o_cols].detach().double().cpu())
+
+            A0 = V @ V.T
+            B0 = sum(O.T @ O for O in o_blocks)
+            scale = float(((torch.trace(A0) + torch.trace(B0)) / (2 * layer_head_dim)).item())
+            lam = max(1e-12, lambda_scale * max(scale, 1e-12))
+            eye = torch.eye(layer_head_dim, dtype=torch.float64)
+            A = A0 + lam * eye
+            B = B0 + lam * eye
+
+            P, info = solve_orthogonal_balancer(A, B)
+            # For orthogonal P, P^{-1} = P^T (det = +1 by construction in the solver).
+            Pinv = P.T
+
+            P_dev = P.to(device=device, dtype=out_dtype)
+            Pinv_dev = Pinv.to(device=o_weight.device, dtype=o_weight.dtype)
+            v_weight[v_rows, :] = P_dev @ v_weight[v_rows, :]
+            for local_head in range(heads_per_kv):
+                head_idx = kv_idx * heads_per_kv + local_head
+                o_cols = slice(head_idx * layer_head_dim, (head_idx + 1) * layer_head_dim)
+                o_weight[:, o_cols] = o_weight[:, o_cols] @ Pinv_dev
+
+            records.append(
+                BalanceRecord(
+                    kind="gqa_vo_orth",
+                    layer=layer_idx,
+                    group=kv_idx,
+                    cond_left=float(info["cond_left"]),
+                    cond_right=float(info["cond_right"]),
+                    cond_transform=float(info["cond_transform"]),
+                    sv_min=float(info["sv_min"]),
+                    sv_max=float(info["sv_max"]),
+                    balance_rel_before=float(info["frob_gap_before"]),
+                    balance_rel_after=float(info["frob_gap_after"]),
+                    clipped=bool(info["clipped"]),
+                    commutator_rel_before=float(info["commutator_rel_before"]),
+                    commutator_rel_after=float(info["commutator_rel_after"]),
+                    subspace_overlap_before=float(info["subspace_overlap_before"]),
+                    subspace_overlap_after=float(info["subspace_overlap_after"]),
+                    ortho_residual=float(info["ortho_residual"]),
+                )
+            )
+
+    return records
+
+
+@torch.no_grad()
 def apply_swiglu_mlp_activation_gradient_balance(
     model,
     hidden_second: list[torch.Tensor],
@@ -317,7 +505,14 @@ def apply_swiglu_mlp_norm_balance(
 def summarize_records(records: list[BalanceRecord]) -> dict[str, float | int]:
     if not records:
         return {"count": 0}
-    return {
+
+    def _opt_mean(name: str) -> float | None:
+        vals = [getattr(r, name) for r in records if getattr(r, name) is not None]
+        if not vals:
+            return None
+        return math.fsum(vals) / len(vals)
+
+    summary: dict[str, float | int | None] = {
         "count": len(records),
         "max_cond_left": max(r.cond_left for r in records),
         "max_cond_right": max(r.cond_right for r in records),
@@ -327,4 +522,13 @@ def summarize_records(records: list[BalanceRecord]) -> dict[str, float | int]:
         "mean_balance_rel_before": math.fsum(r.balance_rel_before for r in records) / len(records),
         "mean_balance_rel_after": math.fsum(r.balance_rel_after for r in records) / len(records),
         "num_clipped": sum(1 for r in records if r.clipped),
+        "mean_commutator_rel_before": _opt_mean("commutator_rel_before"),
+        "mean_commutator_rel_after": _opt_mean("commutator_rel_after"),
+        "mean_subspace_overlap_before": _opt_mean("subspace_overlap_before"),
+        "mean_subspace_overlap_after": _opt_mean("subspace_overlap_after"),
+        "max_ortho_residual": max(
+            (r.ortho_residual for r in records if r.ortho_residual is not None),
+            default=None,
+        ),
     }
+    return summary

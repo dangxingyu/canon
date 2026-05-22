@@ -16,6 +16,7 @@ from activation_gradient_smoke import collect_stats
 from canon.transforms import (
     apply_gqa_value_output_covariance_balance,
     apply_gqa_value_output_norm_balance,
+    apply_gqa_value_output_orthogonal_balance,
     apply_swiglu_mlp_activation_gradient_balance,
     apply_swiglu_mlp_norm_balance,
     summarize_records,
@@ -50,12 +51,34 @@ def tokenize_example(example, tokenizer, max_length: int):
     return full
 
 
+CANONICALIZER_CHOICES = [
+    "original",
+    "vo_norm",
+    "mlp_norm",
+    "combined",
+    "vo_orth",
+    "combined_orth",
+    "actgrad_vo",
+    "actgrad_mlp",
+    "actgrad_combined",
+    "actgrad_mlp_gmean",
+    "actgrad_combined_gmean",
+]
+
+
 def apply_canonicalizer(model, tokenizer, args) -> dict[str, object]:
     name = args.canonicalizer
+    if name not in CANONICALIZER_CHOICES:
+        raise ValueError(f"unknown canonicalizer: {name}")
     records = []
     if name in {"vo_norm", "combined"}:
         records.extend(apply_gqa_value_output_norm_balance(model))
-    if name in {"mlp_norm", "combined"}:
+    if name in {"vo_orth", "combined_orth"}:
+        records.extend(apply_gqa_value_output_orthogonal_balance(model))
+    if name in {"mlp_norm", "combined", "combined_orth"}:
+        # MLP canon is restricted to positive diagonal P regardless of attention
+        # gauge family (elementwise gate * up product forbids non-diagonal P), so
+        # combined_orth reuses the same MLP scaling as combined.
         records.extend(apply_swiglu_mlp_norm_balance(model))
     if name in {"actgrad_vo", "actgrad_mlp", "actgrad_combined", "actgrad_mlp_gmean", "actgrad_combined_gmean"}:
         cov_z, cov_g, h2, gh2, stats_summary = collect_stats(
@@ -80,17 +103,6 @@ def apply_canonicalizer(model, tokenizer, args) -> dict[str, object]:
         return {"summary": summarize_records(records) | {"actgrad_proxy_loss_mean": stats_summary["proxy_loss_mean"]}, "records": [r.to_dict() for r in records]}
     if name == "original":
         return {"summary": {"count": 0}, "records": []}
-    if name not in {
-        "vo_norm",
-        "mlp_norm",
-        "combined",
-        "actgrad_vo",
-        "actgrad_mlp",
-        "actgrad_combined",
-        "actgrad_mlp_gmean",
-        "actgrad_combined_gmean",
-    }:
-        raise ValueError(f"unknown canonicalizer: {name}")
     return {"summary": summarize_records(records), "records": [r.to_dict() for r in records]}
 
 
@@ -100,17 +112,7 @@ def main() -> None:
     parser.add_argument("--out-dir", required=True)
     parser.add_argument(
         "--canonicalizer",
-        choices=[
-            "original",
-            "vo_norm",
-            "mlp_norm",
-            "combined",
-            "actgrad_vo",
-            "actgrad_mlp",
-            "actgrad_combined",
-            "actgrad_mlp_gmean",
-            "actgrad_combined_gmean",
-        ],
+        choices=CANONICALIZER_CHOICES,
         default="original",
     )
     parser.add_argument("--rank", type=int, default=8)

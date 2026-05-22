@@ -12,6 +12,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from canon.transforms import (
     apply_gqa_value_output_norm_balance,
+    apply_gqa_value_output_orthogonal_balance,
     apply_swiglu_mlp_norm_balance,
     summarize_records,
 )
@@ -71,6 +72,12 @@ def main() -> None:
     parser.add_argument("--min-sv", type=float, default=0.25)
     parser.add_argument("--max-sv", type=float, default=4.0)
     parser.add_argument("--dtype", choices=["float32", "bfloat16"], default="float32")
+    parser.add_argument(
+        "--vo-canon",
+        choices=["spd", "orthogonal"],
+        default="spd",
+        help="V/O canon family: SPD (Frobenius balance) or orthogonal (Procrustes).",
+    )
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -90,12 +97,18 @@ def main() -> None:
 
     base_logits = logits_for_prompts(model, tokenizer, PROMPTS, args.device, args.max_length)
 
-    vo_records = apply_gqa_value_output_norm_balance(
-        model,
-        lambda_scale=args.lambda_scale,
-        min_sv=args.min_sv,
-        max_sv=args.max_sv,
-    )
+    if args.vo_canon == "spd":
+        vo_records = apply_gqa_value_output_norm_balance(
+            model,
+            lambda_scale=args.lambda_scale,
+            min_sv=args.min_sv,
+            max_sv=args.max_sv,
+        )
+    else:
+        vo_records = apply_gqa_value_output_orthogonal_balance(
+            model,
+            lambda_scale=args.lambda_scale,
+        )
     vo_logits = logits_for_prompts(model, tokenizer, PROMPTS, args.device, args.max_length)
 
     mlp_records = apply_swiglu_mlp_norm_balance(model, min_scale=args.min_sv, max_scale=args.max_sv)
@@ -104,6 +117,7 @@ def main() -> None:
     metrics = {
         "model_path": args.model_path,
         "dtype": args.dtype,
+        "vo_canon": args.vo_canon,
         "prompts": PROMPTS,
         "vo_vs_original": compare_logits(base_logits, vo_logits),
         "combined_vs_original": compare_logits(base_logits, combined_logits),
