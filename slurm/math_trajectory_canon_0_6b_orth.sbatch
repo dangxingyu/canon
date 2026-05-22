@@ -1,0 +1,68 @@
+#!/bin/bash
+#SBATCH --job-name=canon-math-traj-0.6b-orth
+#SBATCH --partition=pli-c
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=96G
+#SBATCH --time=03:00:00
+#SBATCH --array=0-7%8
+#SBATCH --output=logs/%x-%A_%a.out
+#SBATCH --error=logs/%x-%A_%a.err
+
+set -euo pipefail
+
+cd /scratch/gpfs/ARORA/xd7812/canon
+source /usr/licensed/anaconda3/2025.6/etc/profile.d/conda.sh
+conda activate rllm
+
+export HF_HOME=/scratch/gpfs/ARORA/xd7812/.cache/huggingface
+export TOKENIZERS_PARALLELISM=false
+export PYTHONPATH=/scratch/gpfs/ARORA/xd7812/canon:${PYTHONPATH:-}
+
+mkdir -p logs
+
+# 0.6B mirror of math_trajectory_canon_1_7b_orth.sbatch. Same grid (8 tasks,
+# vo_orth + combined_orth x {no-mid, lazy@500, reset@500} x 2 seeds), same
+# hyperparams as the 0.6B SPD trajectory (job 8566217) so SPD-vs-Orth can be
+# compared at small saturated scale too.
+
+INIT_CANONS=(vo_orth vo_orth combined_orth combined_orth combined_orth combined_orth combined_orth combined_orth)
+MID_STEPS=( ""      ""      ""            ""            500           500           500           500          )
+MID_MODES=( lazy    lazy    lazy          lazy          lazy          lazy          reset         reset        )
+SEEDS=(     1       2       1             2             1             2             1             2            )
+TAGS=(      vo_orth_s1 vo_orth_s2 comb_orth_s1 comb_orth_s2 comb_orth_lazy500_s1 comb_orth_lazy500_s2 comb_orth_reset500_s1 comb_orth_reset500_s2)
+
+I=$SLURM_ARRAY_TASK_ID
+INIT=${INIT_CANONS[$I]}
+MID_STEP=${MID_STEPS[$I]}
+MID_MODE=${MID_MODES[$I]}
+SEED=${SEEDS[$I]}
+TAG=${TAGS[$I]}
+
+OUT_DIR=results/math_trajectory_orth/qwen3_0_6b/lr2e-5_steps1000/${TAG}
+
+EXTRA_ARGS=()
+if [ -n "$MID_STEP" ]; then
+  EXTRA_ARGS+=(--mid-canon-steps "$MID_STEP" --mid-canon-mode "$MID_MODE" --mid-canon-name combined_orth)
+fi
+
+python scripts/math_full_finetune.py \
+  --model-path /scratch/gpfs/ARORA/xd7812/models/Qwen3-0.6B \
+  --out-dir "$OUT_DIR" \
+  --canonicalizer "$INIT" \
+  --eval-source math500 \
+  --lr 2e-5 \
+  --lr-scheduler-type constant_with_warmup \
+  --warmup-ratio 0.03 \
+  --max-steps 1000 \
+  --max-length 1024 \
+  --min-answer-tokens 128 \
+  --seed "$SEED" \
+  --gradient-accumulation-steps 8 \
+  --logging-steps 25 \
+  --eval-strategy-mode steps \
+  --eval-steps-interval 250 \
+  --eval-on-start \
+  "${EXTRA_ARGS[@]}"
