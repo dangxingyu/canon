@@ -19,6 +19,7 @@ __pycache__/
 # virtualenv (if a uv/venv migration happens later)
 .venv/
 venv/
+.venv-gemma4/
 
 # misc
 *.bak
